@@ -1,0 +1,178 @@
+#!/usr/sbin/nft -f
+
+# ========================================
+# Очистка всех существующих таблиц и правил
+# ========================================
+flush ruleset
+
+# ========================================
+# Основная таблица для фильтрации трафика (IPv4 и IPv6)
+# ========================================
+table inet filter {
+    # ========================================
+    # Наборы (sets) для упрощения управления множественными IP и портами
+    # ========================================
+
+    # Набор разрешенных серверов Shadowsocks
+    set allowed_shadowsocks_servers {
+        type ipv4_addr
+        flags interval
+        elements = { 80.92.204.106 }
+    }
+
+    # Набор разрешенных портов Shadowsocks
+    set allowed_shadowsocks_ports {
+        type inet_service
+        elements = { 9098 }
+    }
+
+    # Набор локальных портов redsocks для перенаправления трафика
+    set local_redsocks_ports {
+        type inet_service
+        elements = { 12346 }
+    }
+
+    # Набор локальных портов dnscrypt-proxy
+    set local_dnscrypt_ports {
+        type inet_service
+        elements = { 5354 }
+    }
+
+    # ========================================
+    # Цепочка входящего трафика
+    # ========================================
+    chain input {
+        type filter hook input priority 0; policy drop;
+
+        # Разрешить трафик, связанный с уже установленными соединениями
+        ct state established,related accept
+
+        # Разрешить локальный трафик (loopback)
+        iif lo accept
+
+        # Защита от SYN-Flood атак
+        tcp flags syn ct state new limit rate 100/second accept
+
+        # Разрешить ICMP и ICMPv6 для диагностики (например, ping)
+        ip protocol icmp accept
+        ip6 nexthdr icmpv6 accept
+
+        # Разрешить доступ к dnscrypt-proxy
+        ip daddr 127.0.0.1 tcp dport @local_dnscrypt_ports accept
+        ip daddr 127.0.0.1 udp dport @local_dnscrypt_ports accept
+        ip6 daddr ::1 tcp dport @local_dnscrypt_ports accept
+        ip6 daddr ::1 udp dport @local_dnscrypt_ports accept
+
+        # Разрешить доступ к redsocks
+        ip daddr 127.0.0.1 tcp dport @local_redsocks_ports accept
+        ip daddr 127.0.0.1 udp dport @local_redsocks_ports accept
+        ip6 daddr ::1 tcp dport @local_redsocks_ports accept
+        ip6 daddr ::1 udp dport @local_redsocks_ports accept
+
+        # Разрешить доступ к Shadowsocks серверу
+        ip daddr @allowed_shadowsocks_servers tcp dport @allowed_shadowsocks_ports accept
+        ip daddr @allowed_shadowsocks_servers udp dport @allowed_shadowsocks_ports accept
+
+        # Логирование и блокировка всех остальных входящих пакетов
+        log prefix "nftables input drop: " drop
+    }
+
+    # ========================================
+    # Цепочка перенаправленного трафика (Forward)
+    # ========================================
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+        # В данном случае, перенаправленный трафик не используется
+    }
+
+    # ========================================
+    # Цепочка исходящего трафика
+    # ========================================
+    chain output {
+        type filter hook output priority 0; policy drop;
+
+        # Разрешить локальный трафик (loopback)
+        oif lo accept
+
+        # Разрешить исходящие соединения к серверам Shadowsocks
+        ip daddr @allowed_shadowsocks_servers tcp dport @allowed_shadowsocks_ports accept
+        ip daddr @allowed_shadowsocks_servers udp dport @allowed_shadowsocks_ports accept
+
+        # Разрешить DNS-трафик через dnscrypt-proxy
+        ip daddr 127.0.0.1 tcp dport @local_dnscrypt_ports accept
+        ip daddr 127.0.0.1 udp dport @local_dnscrypt_ports accept
+        ip6 daddr ::1 tcp dport @local_dnscrypt_ports accept
+        ip6 daddr ::1 udp dport @local_dnscrypt_ports accept
+
+        # Разрешить трафик к redsocks
+        ip daddr 127.0.0.1 tcp dport @local_redsocks_ports accept
+        ip daddr 127.0.0.1 udp dport @local_redsocks_ports accept
+        ip6 daddr ::1 tcp dport @local_redsocks_ports accept
+        ip6 daddr ::1 udp dport @local_redsocks_ports accept
+
+        # Разрешить ICMP для диагностики
+        ip protocol icmp accept
+        ip6 nexthdr icmpv6 accept
+
+        # Разрешить трафик, перенаправленный через Redsocks
+        meta mark 1 accept
+
+        # Логирование и блокировка всех остальных исходящих пакетов
+        log prefix "nftables output drop: " drop
+        drop
+    }
+}
+
+# ========================================
+# Таблица NAT для перенаправления трафика через Redsocks
+# ========================================
+table ip nat {
+    chain prerouting {
+        type nat hook prerouting priority -100; policy accept;
+
+        # Перенаправить весь TCP трафик, который не идет к Shadowsocks серверу, на redsocks
+        ip daddr != @allowed_shadowsocks_servers tcp dport != @allowed_shadowsocks_ports redirect to 12346
+
+        # Перенаправить весь UDP трафик, который не идет к Shadowsocks серверу и не к dnscrypt-proxy, на redsocks
+        ip daddr != @allowed_shadowsocks_servers udp dport != @allowed_shadowsocks_ports udp dport != @local_dnscrypt_ports redirect to 12346
+    }
+
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+
+        # Маскарадинг для исходящего трафика через основной сетевой интерфейс
+        # Замените 'YOUR_INTERFACE' на актуальное имя вашего сетевого интерфейса
+        oif enp1s0 masquerade
+    }
+}
+
+# ========================================
+# Таблица для фильтрации UDP-трафика
+# ========================================
+table inet udp_filter {
+    chain output {
+        type filter hook output priority 10; policy accept;
+
+        # Блокировать весь исходящий UDP-трафик, кроме DNS (порт 5354)
+        udp dport != 5354 drop
+    }
+}
+
+# ========================================
+# Таблица для логирования блокируемых пакетов
+# ========================================
+table inet logging {
+    chain log_input {
+        type filter hook input priority 100; policy accept;
+
+        # Логирование и блокировка всех остальных входящих пакетов
+        log prefix "nftables input drop: " drop
+    }
+
+    chain log_output {
+        type filter hook output priority 100; policy accept;
+
+        # Логирование и блокировка всех остальных исходящих пакетов
+        log prefix "nftables output drop: " drop
+    }
+}
