@@ -1,0 +1,103 @@
+#!/usr/sbin/nft -f
+
+# Очистка всех существующих правил
+flush ruleset
+
+# Объявление переменных
+define ss_server_ip = 80.92.204.106
+define ss_server_port = 9098
+define redsocks_port = 12346
+define sslocal_port = 1080
+define external_iface = "enp1s0"  # Замените на ваше реальное имя интерфейса
+
+# Таблица фильтрации трафика
+table inet filter {
+
+    chain input {
+        type filter hook input priority 0; policy drop;
+
+        # Разрешить установленные и связанные соединения
+        ct state established,related accept
+
+        # Разрешить трафик на интерфейсе loopback
+        iif lo accept
+
+        # Разрешить входящие соединения к dnscrypt-proxy на порт 53
+        tcp dport 53 accept
+        udp dport 53 accept
+
+        # Логирование и блокировка остальных пакетов
+        log prefix "nftables input drop: " flags all counter drop
+    }
+
+    chain output {
+        type filter hook output priority 0; policy drop;
+
+        # Разрешить установленные и связанные соединения
+        ct state established,related accept
+
+        # Разрешить трафик на интерфейсе loopback
+        oif lo accept
+
+        # Разрешить исходящие соединения к серверу Shadowsocks
+        ip daddr $ss_server_ip tcp dport $ss_server_port oif $external_iface accept
+        ip daddr $ss_server_ip udp dport $ss_server_port oif $external_iface accept
+
+        # Разрешить трафик к dnscrypt-proxy на порт 53
+        ip daddr 127.0.0.1 tcp dport 53 accept
+        ip daddr 127.0.0.1 udp dport 53 accept
+
+        # Разрешить трафик к sslocal (Shadowsocks локальный клиент)
+        ip daddr 127.0.0.1 tcp dport $sslocal_port accept
+        ip daddr 127.0.0.1 udp dport $sslocal_port accept
+
+        # **Исправление:** Разрешить трафик к redsocks без ограничения по выходному интерфейсу
+        ip daddr 127.0.0.1 tcp dport $redsocks_port accept
+        ip daddr 127.0.0.1 udp dport $redsocks_port accept
+
+        # Логирование и блокировка всего исходящего UDP-трафика (включая ICMP)
+        ip protocol udp log prefix "nftables output drop UDP: " flags all counter drop
+        ip protocol icmp log prefix "nftables output drop ICMP: " flags all counter drop
+
+        # Логирование и блокировка остальных пакетов
+        log prefix "nftables output drop: " flags all counter drop
+    }
+}
+
+# Таблица NAT для перенаправления трафика
+table ip nat {
+
+    chain output {
+        type nat hook output priority -100; policy accept;
+
+        # Исключить трафик к localhost
+        ip daddr 127.0.0.0/8 return
+
+        # Исключить локальные сети из перенаправления
+        ip daddr 0.0.0.0/8 return
+        ip daddr 10.0.0.0/8 return
+        ip daddr 100.64.0.0/10 return
+        ip daddr 169.254.0.0/16 return
+        ip daddr 172.16.0.0/12 return
+        ip daddr 192.168.0.0/16 return
+        ip daddr 224.0.0.0/4 return
+        ip daddr 240.0.0.0/4 return
+
+        # Исключить трафик к серверу Shadowsocks
+        ip daddr $ss_server_ip return
+
+        # Исключить DNS-трафик на порт 53 из перенаправления
+        tcp dport 53 return
+        udp dport 53 return
+
+        # Перенаправить остальной TCP-трафик на redsocks
+        ip protocol tcp dnat to 127.0.0.1:$redsocks_port
+    }
+
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+
+        # Маскарадинг для исходящего трафика
+        oif $external_iface masquerade
+    }
+}
