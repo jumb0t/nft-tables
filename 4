@@ -1,0 +1,95 @@
+#!/usr/sbin/nft -f
+
+# Очистка существующих правил
+flush ruleset
+
+# Определение переменных
+define INET_DEV = "enp1s0"       # Замените на имя вашего сетевого интерфейса
+define SSL_LOCAL_PORT = 1080
+define REDSOCKS_PORT = 12346
+
+table inet killswitch {
+
+    chain input {
+        type filter hook input priority 0; policy drop;
+
+        # Разрешить установленные и связанные соединения
+        ct state established,related accept
+
+        # Разрешить трафик на интерфейсе loopback
+        iif lo accept
+
+        # Разрешить входящие DNS-ответы от DNS-серверов
+        ip saddr { 127.0.0.1 } udp sport 53 accept
+        ip saddr { 127.0.0.1 } tcp sport 53 accept
+
+        # Разрешить входящие соединения от redsocks (если необходимо)
+        ip saddr 127.0.0.1 tcp sport $REDSOCKS_PORT accept
+        ip saddr 127.0.0.1 udp sport $REDSOCKS_PORT accept
+
+        # Блокировать весь остальной UDP-трафик и ICMP
+        ip protocol udp log prefix "INPUT UDP drop: " counter drop
+        ip protocol icmp log prefix "INPUT ICMP drop: " counter drop
+
+        # Логирование и блокировка остальных пакетов
+        log prefix "INPUT drop: " counter drop
+    }
+
+    chain output {
+        type filter hook output priority 0; policy drop;
+
+        # Разрешить установленные и связанные соединения
+        ct state established,related accept
+
+        # Разрешить трафик на интерфейсе loopback
+        oif lo accept
+
+        # Разрешить исходящие TCP-соединения к серверам Shadowsocks на указанных портах
+        ip daddr { 80.92.204.106, 203.0.113.1 } tcp dport { 9098, 8388 } oifname $INET_DEV accept
+
+        # Разрешить исходящие DNS-запросы к DNS-серверам
+        ip daddr { 127.0.0.1 } udp dport 53 oifname $INET_DEV accept
+        ip daddr { 127.0.0.1 } tcp dport 53 oifname $INET_DEV accept
+
+        # Разрешить исходящий трафик к локальному sslocal
+        ip daddr 127.0.0.1 tcp dport $SSL_LOCAL_PORT oif lo accept
+
+        # Разрешить исходящий трафик к redsocks
+        ip daddr 127.0.0.1 tcp dport $REDSOCKS_PORT oif lo accept
+        ip daddr 127.0.0.1 udp dport $REDSOCKS_PORT oif lo accept
+
+        # Блокировать весь остальной UDP-трафик и ICMP
+        ip protocol udp log prefix "OUTPUT UDP drop: " counter drop
+        ip protocol icmp log prefix "OUTPUT ICMP drop: " counter drop
+
+        # Логирование и блокировка остальных пакетов
+        log prefix "OUTPUT drop: " counter drop
+    }
+}
+
+table ip nat {
+
+    chain output {
+        type nat hook output priority -100; policy accept;
+
+        # Исключить трафик к localhost
+        ip daddr 127.0.0.0/8 return
+
+        # Исключить трафик к серверам Shadowsocks
+        ip daddr { 80.92.204.106, 203.0.113.1 } return
+
+        # Исключить DNS-трафик
+        tcp dport 53 return
+        udp dport 53 return
+
+        # Перенаправить остальной TCP-трафик на redsocks
+        ip protocol tcp dnat to 127.0.0.1:$REDSOCKS_PORT
+    }
+
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+
+        # Маскарадинг для исходящего трафика
+        oif $INET_DEV masquerade
+    }
+}
